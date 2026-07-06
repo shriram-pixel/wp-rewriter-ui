@@ -1,0 +1,9 @@
+{
+  "post_type": "page",
+  "post_status": ["publish"],
+  "ids": [],
+  "placeholders": { "company": "//title" },
+  "rows": [
+    { "xpath": "//p", "prompt": "Rewrite {{h1}} for {{company}}. Return only the new heading." }
+  ]
+}

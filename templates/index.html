@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WP Rewriter</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo" aria-hidden="true"></span>
+    <div>
+      <h1>WP Rewriter</h1>
+      <p class="tagline">Find &amp; replace and AI rewrites on a live WordPress site, over SSH.</p>
+    </div>
+  </div>
+  <button id="statusPill" class="status status--unknown" title="Connection status">
+    <span class="dot" aria-hidden="true"></span>
+    <span id="statusText">Not connected</span>
+  </button>
+</header>
+
+
+
+<div class="shell">
+  <nav class="rail" aria-label="Sections">
+    <button class="rail__item is-active" data-panel="connection"><span class="rail__no">01</span> Connection</button>
+    <button class="rail__item" data-panel="replace"><span class="rail__no">02</span> Find &amp; replace</button>
+    <button class="rail__item" data-panel="rewrite"><span class="rail__no">03</span> AI rewrite</button>
+    <button class="rail__item" data-panel="logo"><span class="rail__no">04</span> Logo</button>
+  </nav>
+
+  <main class="content">
+
+    <!-- ============ CONNECTION ============ -->
+    <section id="panel-connection" class="panel is-active">
+      <div class="panel__head">
+        <h2>Connection</h2>
+        <p>Where to connect and which model to use. Settings are saved to <code>config.ini</code>.</p>
+      </div>
+
+      <div class="card grid2">
+        <label class="field">SSH host / IP
+          <input id="cfg-host" type="text" placeholder="203.0.113.10">
+        </label>
+        <label class="field">Port
+          <input id="cfg-port" type="text" value="22">
+        </label>
+        <label class="field">Username
+          <input id="cfg-username" type="text" placeholder="root">
+        </label>
+        <label class="field">Password
+          <input id="cfg-password" type="password" autocomplete="off" placeholder="SSH password">
+        </label>
+        <label class="field span2">Working folder path <span class="hint">the WordPress folder that contains wp-config.php</span>
+          <input id="cfg-path" type="text" placeholder="/var/www/html">
+        </label>
+        <label class="field">wp binary <span class="hint">usually just “wp”</span>
+          <input id="cfg-wpbin" type="text" value="wp">
+        </label>
+        <label class="field span2">AI provider
+          <select id="cfg-provider">
+            <option value="api">API key — OpenAI / OpenRouter / Gemini / Groq</option>
+            <option value="cli">Claude CLI — uses your Claude Code login (no API key)</option>
+          </select>
+        </label>
+        <label class="field span2 ai-api">API key
+          <input id="cfg-key" type="password" autocomplete="off" placeholder="leave blank to keep saved key">
+        </label>
+        <label class="field span2 ai-api">API base URL
+          <input id="cfg-base" type="text" placeholder="https://api.openai.com/v1">
+        </label>
+        <label class="field ai-api">Model
+          <input id="cfg-model" type="text" value="gpt-4o-mini">
+        </label>
+        <label class="field ai-api">Max tokens
+          <input id="cfg-maxtokens" type="number" min="1" value="256">
+        </label>
+        <label class="field ai-api">Temperature
+          <input id="cfg-temp" type="number" step="0.1" min="0" max="2" value="0.7">
+        </label>
+        <label class="field span2 ai-cli" style="display:none">Claude command <span class="hint">usually just “claude”; or the full path to the CLI</span>
+          <input id="cfg-cli-cmd" type="text" placeholder="claude">
+        </label>
+        <label class="field span2 ai-cli" style="display:none">Model <span class="hint">optional — blank uses your Claude Code default (e.g. sonnet, opus)</span>
+          <input id="cfg-cli-model" type="text" placeholder="leave blank for default">
+        </label>
+        <div class="span2 ai-cli" style="display:none; font-size:.8rem; color:var(--muted); line-height:1.5">
+          Install Claude Code and run <code>claude login</code> once in a terminal. Rewrites then use your Claude subscription — no API key. It’s a bit slower per item than the API.
+        </div>
+      </div>
+
+      <div class="actions">
+        <button id="saveCfg" class="btn">Save settings</button>
+        <button id="testConn" class="btn btn--accent">Test connection</button>
+        <button id="testAI" class="btn btn--ghost">Test AI</button>
+      </div>
+      <pre id="checkOut" class="out" hidden></pre>
+    </section>
+
+    <!-- ============ FIND & REPLACE ============ -->
+    <section id="panel-replace" class="panel">
+      <div class="panel__head">
+        <h2>Find &amp; replace</h2>
+        <p>Runs <code>wp search-replace</code> on the server — serialization-safe, so page-builder and ACF content is handled too.</p>
+      </div>
+
+      <div class="card grid2">
+        <label class="field">Find <span class="hint">one value per line</span>
+          <textarea id="rep-old" rows="7" class="mono" placeholder="old-company-name&#10;old-email&#10;old-address&#10;old-location"></textarea>
+        </label>
+        <label class="field">Replace with <span class="hint">matched line-by-line</span>
+          <textarea id="rep-new" rows="7" class="mono" placeholder="new-company-name&#10;new-email&#10;new-address&#10;new-location"></textarea>
+        </label>
+        <div class="span2 opts">
+          <label class="checkline"><input type="checkbox" id="rep-ci" checked> Case-insensitive — also replace other capitalizations, keeping each one's case</label>
+          <label class="checkline"><input type="checkbox" id="rep-url" checked> Replace page and image URLs everywhere (permalinks + rename matching media files)</label>
+        </div>
+      </div>
+
+      <div class="actions">
+        <button id="runReplace" class="btn btn--apply">Run apply</button>
+        <button id="repClear" class="btn btn--ghost">Clear</button>
+      </div>
+      <pre id="replaceOut" class="out" hidden></pre>
+    </section>
+
+    <!-- ============ AI REWRITE ============ -->
+    <section id="panel-rewrite" class="panel">
+      <div class="panel__head">
+        <h2>AI rewrite</h2>
+        <p>Target content by XPath, fill the prompt, and rewrite with AI. <code>{{title}}</code> and <code>{{h1}}</code> are built in.</p>
+      </div>
+
+      <div class="card">
+        <h3>1 · Posts</h3>
+        <div class="row">
+          <label class="field inline">Post type
+            <select id="rw-type">
+              <option value="page">Pages</option>
+              <option value="post">Posts</option>
+            </select>
+          </label>
+          <fieldset class="field inline statuses">Statuses
+            <div class="checks">
+              <label><input type="checkbox" value="publish" checked> publish</label>
+              <label><input type="checkbox" value="draft" checked> draft</label>
+              <label><input type="checkbox" value="private" checked> private</label>
+              <label><input type="checkbox" value="pending" checked> pending</label>
+            </div>
+          </fieldset>
+          <label class="field inline" style="margin-left:auto">Filter
+            <input id="postSearch" type="search" placeholder="Search loaded pages…" style="min-width:220px">
+          </label>
+          <button id="loadPosts" class="btn" style="margin-left:0">Load posts</button>
+        </div>
+        <div id="postList" class="checklist" hidden></div>
+      </div>
+
+      <div class="card">
+        <h3>2 · Placeholders <span class="hint">map a key to an XPath</span></h3>
+        <table class="tbl" id="phTable"><tbody></tbody></table>
+        <button id="addPh" class="btn btn--ghost">+ Add placeholder</button>
+      </div>
+
+      <div class="card">
+        <h3>3 · XPath &amp; prompt</h3>
+        <div id="xpRows"></div>
+        <button id="addXp" class="btn btn--ghost">+ Add row</button>
+      </div>
+
+      <div class="card">
+        <h3>4 · Run</h3>
+        <label class="checkline" style="display:none"><input type="checkbox" id="rw-elementor" checked> Auto-detect the page builder (Elementor, WPBakery, Divi, …) and rewrite its visible text</label>
+        <div class="actions">
+          <button id="runRewrite" class="btn btn--apply">Start rewrite</button>
+          <button id="stopRewrite" class="btn btn--ghost" hidden>Stop</button>
+        </div>
+        <div id="rwProgress" class="progress" hidden>
+          <div class="counts">
+            <span class="count count--ok"><b id="c-updated">0</b> updated</span>
+            <span class="count"><b id="c-skipped">0</b> skipped</span>
+            <span class="count count--err"><b id="c-error">0</b> errors</span>
+            <span class="count count--muted"><b id="c-of">0 / 0</b></span>
+          </div>
+          <pre id="rwLog" class="out out--log"></pre>
+        </div>
+      </div>
+    </section>
+
+    <section id="panel-logo" class="panel">
+      <div class="panel__head">
+        <h2>Replace logo</h2>
+      </div>
+
+      <div class="card grid2">
+        <label class="field">Old logo URL
+          <input id="logo-old" type="text" class="mono" placeholder="https://yoursite.com/wp-content/uploads/2023/05/old-logo.png" />
+        </label>
+        <label class="field">New logo URL
+          <input id="logo-new" type="text" class="mono" placeholder="https://yoursite.com/wp-content/uploads/2024/01/new-logo.png" />
+        </label>
+
+        <div class="span2 field">…or upload a new logo to the media library
+          <div class="actions" style="margin-top:6px">
+            <input id="logo-file" type="file" accept="image/*" />
+            <button id="logo-upload" class="btn">Upload</button>
+          </div>
+        </div>
+
+        <label class="span2 checkline" style="display:none"><input type="checkbox" id="logo-identity" checked /> Also set it as the theme's Site Identity logo</label>
+      </div>
+
+      <div class="actions">
+        <button id="logo-replace" class="btn btn--apply">Replace logo everywhere</button>
+        <button id="logo-clear" class="btn btn--ghost">Clear</button>
+      </div>
+      <pre id="logoOut" class="out" hidden></pre>
+
+      <div class="card" style="margin-top:1rem">
+        <h3>Favicon</h3>
+        <div class="field">Upload a new favicon
+          <div class="actions" style="margin-top:6px">
+            <input id="favicon-file" type="file" accept="image/*" />
+            <button id="favicon-set" class="btn btn--apply">Upload &amp; set favicon</button>
+          </div>
+        </div>
+        <pre id="faviconOut" class="out" hidden></pre>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<template id="xpRowTpl">
+  <div class="xprow">
+    <div class="xprow__inputs">
+      <input class="mono xp-xpath" placeholder="//h1">
+      <textarea rows="3" class="xp-prompt" placeholder="Rewrite {{h1}} for {{company}}. Return only the new heading."></textarea>
+    </div>
+    <div class="xprow__side">
+      <button type="button" class="btn btn--ghost btn--sm xp-fetch">Fetch sample</button>
+      <button type="button" class="btn btn--ghost btn--sm xp-test">Test prompt</button>
+      <button type="button" class="btn btn--ghost btn--sm xp-del" title="Remove row">Remove</button>
+      <div class="xp-result"></div>
+    </div>
+  </div>
+</template>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

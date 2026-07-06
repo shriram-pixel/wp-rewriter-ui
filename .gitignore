@@ -1,0 +1,12 @@
+# secrets - never commit your real credentials
+config.ini
+
+# python
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# OS junk
+.DS_Store
+Thumbs.db
