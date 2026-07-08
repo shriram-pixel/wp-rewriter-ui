@@ -2174,23 +2174,40 @@ _SLUG_SEP_L = ("-", "_", "/")
 _SLUG_SEP_R = ("-", "_", ".", "/")
 
 
+def _url_forms(o):
+    """The shapes a term can take inside URLs / media filenames: the hyphen slug,
+    the spaced form, and the underscore form. Covers links a previous run may have
+    created with a space in them (before slugging was fixed)."""
+    lo = (o or "").strip().lower()
+    forms = []
+    for f in (slugify(o), lo, lo.replace(" ", "_")):
+        if f and f not in forms:
+            forms.append(f)
+    return forms
+
+
 def _url_slug_pairs(pairs):
-    """Slug-boundary variants so the search term *inside a URL or media filename*
-    (…-india.jpg, /india/, …-india-150x150.jpg) is replaced with the URL slug of
-    NEW — e.g. 'United States' -> 'united-states' — instead of a literal value
-    that would put a space in the link. Only generated when NEW isn't already a
-    clean slug, and the boundaries (-, _, /, .) keep these from matching prose."""
+    """Bounded (-, _, /, .) variants that match the search term *inside a URL or
+    media filename* — in hyphen, spaced, OR underscore form — and replace it with
+    the URL slug of NEW. This works in both directions:
+      india -> United States :  …-india.jpg          -> …-united-states.jpg
+      United States -> India :  …-united-states.jpg  -> …-india.jpg
+                                …-united states.jpg  -> …-india.jpg   (fixes old bug)
+    The boundaries keep these from ever matching prose."""
     out, seen = [], set()
     for o, n in pairs:
-        so, sn = slugify(o), slugify(n)
-        if not so or so == sn or n == sn:   # nothing to slug-fix
+        sn = slugify(n)
+        if not sn:
             continue
-        for L in _SLUG_SEP_L:
-            for R in _SLUG_SEP_R:
-                a = L + so + R
-                if a not in seen:
-                    seen.add(a)
-                    out.append((a, L + sn + R))
+        for fo in _url_forms(o):
+            if fo == sn:
+                continue
+            for L in _SLUG_SEP_L:
+                for R in _SLUG_SEP_R:
+                    a = L + fo + R
+                    if a not in seen:
+                        seen.add(a)
+                        out.append((a, L + sn + R))
     return out
 
 
@@ -2474,14 +2491,18 @@ def rename_media(cfg, pairs, apply=False, smart_case=False):
     """Rename media files whose name contains the search term, so URLs rewritten
     by search-replace still resolve. The scan and the renames run in a single
     server-side PHP pass (fast even for tens of thousands of files)."""
-    # Filenames are URL slugs, so rename using the slug form of NEW
-    # ('United States' -> 'united-states'), matching the DB URL updates above.
+    # Filenames are URL slugs, so rename any old form of the term (hyphen slug,
+    # spaced, or underscore) to the slug of NEW — e.g. 'united-states.jpg' AND a
+    # left-over 'united states.jpg' both become 'india.jpg'.
     slug_pairs, seen = [], set()
     for o, n in pairs:
-        so, sn = slugify(o), slugify(n)
-        if so and so != sn and so not in seen:
-            seen.add(so)
-            slug_pairs.append((so, sn))
+        sn = slugify(n)
+        if not sn:
+            continue
+        for fo in _url_forms(o):
+            if fo != sn and fo not in seen:
+                seen.add(fo)
+                slug_pairs.append((fo, sn))
     if not slug_pairs:
         return {"rc": 0, "report": "No find/replace pairs to apply to media."}
     spec = {"pairs": [[o, n] for o, n in slug_pairs], "apply": bool(apply)}
