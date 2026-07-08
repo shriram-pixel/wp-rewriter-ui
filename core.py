@@ -2165,6 +2165,35 @@ def expand_pairs(pairs, smart_case):
     return list(out.items())
 
 
+def slugify(s):
+    """URL/filename slug: lowercase, runs of non-alphanumerics -> a single hyphen."""
+    return re.sub(r"[^a-z0-9]+", "-", (s or "").strip().lower()).strip("-")
+
+
+_SLUG_SEP_L = ("-", "_", "/")
+_SLUG_SEP_R = ("-", "_", ".", "/")
+
+
+def _url_slug_pairs(pairs):
+    """Slug-boundary variants so the search term *inside a URL or media filename*
+    (…-india.jpg, /india/, …-india-150x150.jpg) is replaced with the URL slug of
+    NEW — e.g. 'United States' -> 'united-states' — instead of a literal value
+    that would put a space in the link. Only generated when NEW isn't already a
+    clean slug, and the boundaries (-, _, /, .) keep these from matching prose."""
+    out, seen = [], set()
+    for o, n in pairs:
+        so, sn = slugify(o), slugify(n)
+        if not so or so == sn or n == sn:   # nothing to slug-fix
+            continue
+        for L in _SLUG_SEP_L:
+            for R in _SLUG_SEP_R:
+                a = L + so + R
+                if a not in seen:
+                    seen.add(a)
+                    out.append((a, L + sn + R))
+    return out
+
+
 def _table_prefix(cfg):
     rc, out, _ = wp_run(cfg, ["config", "get", "table_prefix"], timeout=30)
     return out.strip() if rc == 0 and out.strip() else "wp_"
@@ -2333,9 +2362,18 @@ def _run_replace_batch(cfg, spec):
 
 
 def run_replace(cfg, pairs, scope="prefix", apply=False, smart_case=False, include_guid=False, skip_logs=True):
+    orig = list(pairs)
     pairs = expand_pairs(pairs, smart_case)
     if not pairs:
         return {"rc": 0, "report": "Nothing to replace."}
+    # When URLs are in scope, fix media links to slug form FIRST — before the
+    # literal word replacement would leave a space (e.g. '…-united states.jpg').
+    # These pairs are bounded by -, _, /, . so they only hit URLs/filenames.
+    if include_guid:
+        slug_pairs = _url_slug_pairs(orig)
+        if slug_pairs:
+            keys = {o for o, _ in slug_pairs}
+            pairs = slug_pairs + [(o, n) for o, n in pairs if o not in keys]
     spec = {
         "search": [o for o, n in pairs],
         "replace": [n for o, n in pairs],
@@ -2436,10 +2474,17 @@ def rename_media(cfg, pairs, apply=False, smart_case=False):
     """Rename media files whose name contains the search term, so URLs rewritten
     by search-replace still resolve. The scan and the renames run in a single
     server-side PHP pass (fast even for tens of thousands of files)."""
-    pairs = expand_pairs(pairs, smart_case)
-    if not pairs:
+    # Filenames are URL slugs, so rename using the slug form of NEW
+    # ('United States' -> 'united-states'), matching the DB URL updates above.
+    slug_pairs, seen = [], set()
+    for o, n in pairs:
+        so, sn = slugify(o), slugify(n)
+        if so and so != sn and so not in seen:
+            seen.add(so)
+            slug_pairs.append((so, sn))
+    if not slug_pairs:
         return {"rc": 0, "report": "No find/replace pairs to apply to media."}
-    spec = {"pairs": [[o, n] for o, n in pairs], "apply": bool(apply)}
+    spec = {"pairs": [[o, n] for o, n in slug_pairs], "apply": bool(apply)}
     runner = "/tmp/wprw-rename-%d.php" % os.getpid()
     specf = "/tmp/wprw-rename-spec-%d.json" % os.getpid()
     rc, _, err = ssh_run(cfg, "cat > " + shlex.quote(runner), stdin_data=_RENAME_RUNNER_PHP)
