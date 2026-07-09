@@ -2186,40 +2186,42 @@ def _url_forms(o):
     return forms
 
 
-def _slug_case_variants(form):
-    """lower, UPPER and Title-Each-Word variants of a slug form, so a filename
-    written as 'New-Zealand' (or 'NEW-ZEALAND') is matched even though the match
-    is case-sensitive."""
-    return {form, form.upper(),
-            re.sub(r"[A-Za-z]+", lambda m: m.group(0).capitalize(), form)}
+def _title_each(s):
+    """Capitalize each word in a slug: 'new-zealand' -> 'New-Zealand'."""
+    return re.sub(r"[A-Za-z]+", lambda m: m.group(0).capitalize(), s)
+
+
+def _slug_case_pairs(base, sn):
+    """Case-preserving (old_form -> new_slug) variants so a Title-Case link stays
+    Title-Case after the swap: lower->lower, UPPER->UPPER, Title-Each->Title-Each.
+    e.g. base='new-zealand', sn='india' ->
+      ('new-zealand','india'), ('NEW-ZEALAND','INDIA'), ('New-Zealand','India')."""
+    return [(base, sn), (base.upper(), sn.upper()), (_title_each(base), _title_each(sn))]
 
 
 def _url_slug_pairs(pairs):
     """Bounded (-, _, /, .) variants that match the search term *inside a URL or
-    media filename* — in hyphen, spaced, or underscore form, and in any letter
-    case — and replace it with the URL slug of NEW. Works in both directions:
-      india -> United States :  …-india.jpg           -> …-united-states.jpg
-      New Zealand -> India   :  …-New-Zealand.jpg      -> …-india.jpg
-                                …-new-zealand.jpg      -> …-india.jpg
-                                …-new zealand.jpg      -> …-india.jpg   (fixes old bug)
+    media filename* — in hyphen, spaced, or underscore form, in any letter case —
+    and replace it with the URL slug of NEW while KEEPING the case pattern:
+      New Zealand -> India :  …-New-Zealand.jpg  -> …-India.jpg
+                              …-new-zealand.jpg  -> …-india.jpg
+                              …-NEW-ZEALAND.jpg  -> …-INDIA.jpg
     The boundaries keep these from ever matching prose."""
     out, seen = [], set()
     for o, n in pairs:
         sn = slugify(n)
         if not sn:
             continue
-        forms = set()
         for base in _url_forms(o):
-            forms |= _slug_case_variants(base)
-        for fo in forms:
-            if fo.lower() == sn:
-                continue
-            for L in _SLUG_SEP_L:
-                for R in _SLUG_SEP_R:
-                    a = L + fo + R
-                    if a not in seen:
-                        seen.add(a)
-                        out.append((a, L + sn + R))
+            for fo, fn in _slug_case_pairs(base, sn):
+                if fo == fn:
+                    continue
+                for L in _SLUG_SEP_L:
+                    for R in _SLUG_SEP_R:
+                        a = L + fo + R
+                        if a not in seen:
+                            seen.add(a)
+                            out.append((a, L + fn + R))
     return out
 
 
@@ -2503,22 +2505,20 @@ def rename_media(cfg, pairs, apply=False, smart_case=False):
     """Rename media files whose name contains the search term, so URLs rewritten
     by search-replace still resolve. The scan and the renames run in a single
     server-side PHP pass (fast even for tens of thousands of files)."""
-    # Filenames are URL slugs, so rename any form of the term (hyphen slug,
-    # spaced, or underscore — in any letter case) to the slug of NEW. e.g.
-    # 'Bars-in-New-Zealand.jpg' AND 'bars-in-new zealand.jpg' both become
-    # '…-india.jpg'.
+    # Filenames are URL slugs; rename any form of the term (hyphen/space/underscore,
+    # any letter case) to the slug of NEW while KEEPING the case pattern, so a
+    # Title-Case file 'Bars-in-New-Zealand.jpg' becomes 'Bars-in-India.jpg' and
+    # matches the URL update above.
     slug_pairs, seen = [], set()
     for o, n in pairs:
         sn = slugify(n)
         if not sn:
             continue
-        forms = set()
         for base in _url_forms(o):
-            forms |= _slug_case_variants(base)
-        for fo in forms:
-            if fo.lower() != sn and fo not in seen:
-                seen.add(fo)
-                slug_pairs.append((fo, sn))
+            for fo, fn in _slug_case_pairs(base, sn):
+                if fo != fn and fo not in seen:
+                    seen.add(fo)
+                    slug_pairs.append((fo, fn))
     if not slug_pairs:
         return {"rc": 0, "report": "No find/replace pairs to apply to media."}
     spec = {"pairs": [[o, n] for o, n in slug_pairs], "apply": bool(apply)}
