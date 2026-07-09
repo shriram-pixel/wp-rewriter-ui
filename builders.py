@@ -59,45 +59,67 @@ def _set_node_content(node, reply):
 
 
 # --------------------------------------------------------------------------
-# Link preservation: rewriting flattens a node to plain text, which drops any
-# inline <a> links. To keep them, we swap each <a>…</a> for a token (⟦Ln⟧)
-# before the AI sees the text, then restore the original anchors afterwards.
-# The URL never reaches the model, so it can't be changed or dropped.
+# Inline preservation: rewriting can drop or reword inline <a> links and
+# <b>/<strong> bold runs. To keep them exact, we swap each such element for a
+# token (⟦Ln⟧) before the AI sees the text, then restore the originals after.
+# So a link's URL and a bolded run (e.g. a product list) come back unchanged and
+# still bold, while the surrounding prose is rewritten.
 # --------------------------------------------------------------------------
-_LINK_RE = re.compile(r"<a\b[^>]*>.*?</a>", re.I | re.S)
+_LINK_RE = re.compile(r"<(a|b|strong)\b[^>]*>.*?</\1>", re.I | re.S)
 _TOK_OPEN = "\u27e6"   # ⟦
 _TOK_CLOSE = "\u27e7"  # ⟧
 _TOK_RE = re.compile(_TOK_OPEN + r"L(\d+)" + _TOK_CLOSE)
 
 LINK_HINT = ("Some words are replaced with markers like " + _TOK_OPEN + "L0" + _TOK_CLOSE +
-             ". Keep every marker exactly as written, once each, in a natural spot — "
-             "they are links. Do not add, remove, renumber, or alter them.")
+             ". Keep every marker exactly as written, once each, in a natural spot — they "
+             "stand for links and bold text that must stay exactly as-is. Do not add, "
+             "remove, renumber, translate, or alter them.")
 
 
-def mask_links(fragment):
-    """Replace <a>…</a> in an HTML fragment with ⟦Ln⟧ tokens and reduce the rest
-    to plain text. Returns (masked_plaintext, links)."""
+_LINK_ONLY_RE = re.compile(r"<a\b[^>]*>.*?</a>", re.I | re.S)
+
+
+def _apply_mask(s, pattern):
     links = []
 
     def repl(m):
         links.append(m.group(0))
         return _TOK_OPEN + "L" + str(len(links) - 1) + _TOK_CLOSE
-    masked = _LINK_RE.sub(repl, fragment or "")
+    return pattern.sub(repl, s or ""), links
+
+
+def _has_free_prose(masked):
+    """Any real words left after removing the ⟦Ln⟧ tokens and the HTML tags?"""
+    t = _TOK_RE.sub(" ", masked)
+    t = re.sub(r"<[^>]+>", " ", t)
+    return bool(re.search(r"[^\W\d_]", t))
+
+
+def _mask_with_fallback(s, strip_pattern):
+    """Protect <a>/<b>/<strong>. But if doing so would leave nothing for the AI
+    to rewrite (the whole field is one bold/strong run, e.g. <p><b>Heading</b></p>),
+    fall back to protecting only links so the text CAN be rewritten — its
+    <b>/<strong> tags stay in place for the model to keep."""
+    masked, links = _apply_mask(s, _LINK_RE)
+    if links and not _has_free_prose(masked):
+        masked, links = _apply_mask(s, _LINK_ONLY_RE)
+    return masked, links
+
+
+def mask_links(fragment):
+    """Protect <a>/<b>/<strong> as tokens, then reduce the rest to plain text.
+    Returns (masked_plaintext, links)."""
+    masked, links = _mask_with_fallback(fragment, _LINK_RE)
     text = re.sub(r"<[^>]+>", "", masked)
     text = html.unescape(text)
     return re.sub(r"[ \t\r\n]+", " ", text).strip(), links
 
 
 def mask_links_inplace(s):
-    """Tokenise <a>…</a> but leave all other HTML untouched — used for fields
-    whose surrounding markup (paragraphs, bold, lists) must be preserved
-    (Elementor text-editor, Beaver rich-text). Returns (masked, links)."""
-    links = []
-
-    def repl(m):
-        links.append(m.group(0))
-        return _TOK_OPEN + "L" + str(len(links) - 1) + _TOK_CLOSE
-    return _LINK_RE.sub(repl, s or ""), links
+    """Protect <a>/<b>/<strong> as tokens but leave all other HTML in place — for
+    fields whose markup (paragraphs, lists) must be preserved (Elementor
+    text-editor, Beaver rich-text). Returns (masked, links)."""
+    return _mask_with_fallback(s, _LINK_RE)
 
 
 def restore_links(reply, links):
@@ -121,6 +143,30 @@ def node_inner_html(node):
     for child in node:
         parts.append(_lh.tostring(child, encoding="unicode"))
     return "".join(parts)
+
+
+# Navigation breadcrumbs ("Home > A286 Foil") are chrome, not content — never
+# rewrite them, even when hand-typed into a plain <p>. Mirrors core's detector.
+_BREADCRUMB_SEP_RE = re.compile(r"\s+(?:>|\u00bb|\u203a|\u2192|\u276f|/)\s+")
+_HOME_WORDS = {"home", "homepage", "inicio", "in\u00edcio", "accueil", "startseite",
+               "start", "hem", "hjem", "\u4e3b\u9875", "\u9996\u9875",
+               "\u30db\u30fc\u30e0", "\u0939\u094b\u092e"}
+
+
+def is_breadcrumb(val):
+    text = re.sub(r"<[^>]+>", " ", val or "")
+    text = html.unescape(text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text or len(text) > 120:
+        return False
+    parts = _BREADCRUMB_SEP_RE.split(text)
+    if not (2 <= len(parts) <= 6):
+        return False
+    for p in parts:
+        p = p.strip()
+        if not p or len(p) > 40 or re.search(r"[.!?]", p):
+            return False
+    return parts[0].strip().lower() in _HOME_WORDS
 
 
 # --------------------------------------------------------------------------
@@ -339,6 +385,8 @@ class ShortcodeDoc:
                 kind, level = "button", None
             else:
                 continue
+            if is_breadcrumb(node_inner_html(node)):   # skip nav breadcrumbs
+                continue
             holder = {"links": []}
 
             def _get(node=node, holder=holder):
@@ -431,6 +479,8 @@ class BricksDoc:
                 continue
             for fld in ("text", "content"):
                 if isinstance(settings.get(fld), str) and settings[fld].strip():
+                    if is_breadcrumb(settings[fld]):   # skip nav breadcrumbs
+                        break
                     kind, level = _bricks_kind(name, settings)
                     holder = {"links": []}
 

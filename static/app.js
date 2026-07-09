@@ -1,5 +1,12 @@
 "use strict";
 
+// Default AI-rewrite prompt (pre-filled into every XPath row; editable per row).
+const DEFAULT_PROMPT =
+  "Rewrite the following, keeping the same meaning and tone.\n" +
+  "Preserve any HTML tags and formatting intact.\n" +
+  "Return only the rewritten content, nothing else:\n" +
+  "{{text}}";
+
 const $ = (s, r = document) => r.querySelector(s);
 
 /* Cross-task guard: only one write-job (AI rewrite / Find & replace) runs at a
@@ -433,7 +440,7 @@ function gatherPlaceholders() {
 
 /* ---------------- xpath rows ---------------- */
 $("#addXp").addEventListener("click", () => addXp());
-function addXp(xpath = "", prompt = "") {
+function addXp(xpath = "", prompt = DEFAULT_PROMPT) {
   const node = $("#xpRowTpl").content.firstElementChild.cloneNode(true);
   node.querySelector(".xp-xpath").value = xpath;
   node.querySelector(".xp-prompt").value = prompt;
@@ -608,7 +615,7 @@ function escapeAttr(s) {
 
 /* ---------------- boot ---------------- */
 addPh("company", "//title");
-addXp("//p", "Rewrite the following text, keeping the same meaning and tone. Return only the new text:\n{{text}}");
+addXp("//p");
 loadConfig().then(() => {
   // Quietly probe the connection so the status pill is meaningful on load.
   api("/api/check", {}).then((r) => {

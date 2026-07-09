@@ -921,6 +921,8 @@ def _process_beaver(cfg, post, rows, placeholders):
         val = s.get(spec["field"])
         if not isinstance(val, str) or not val.strip():
             continue
+        if _is_breadcrumb_value(val):          # skip nav breadcrumbs
+            continue
         level = str(s.get("tag", "")) if spec["kind"] == "heading" else ""
         nodes.append({"node": str(nid), "field": spec["field"],
                       "kind": spec["kind"], "level": level, "text": val})
@@ -1030,6 +1032,8 @@ def process_one(cfg, post, rows, placeholders):
         for row in rows:
             expr = row.get("xpath", "")
             nodes = [n for n in (root.xpath(expr) if expr else []) if hasattr(n, "tag")]
+            # never rewrite breadcrumb trails ("Home > A286 Foil") caught by //p / //*
+            nodes = [n for n in nodes if not _is_breadcrumb_value(inner_html(n))]
             if not nodes:
                 continue
             node = nodes[0]
@@ -1500,6 +1504,7 @@ _HOME_WORDS = {
 
 def _is_breadcrumb_value(val):
     text = re.sub(r"<[^>]+>", " ", val or "")
+    text = html.unescape(text)          # &gt; / &raquo; etc. -> real separators
     text = re.sub(r"\s+", " ", text).strip()
     if not text or len(text) > 120:
         return False
@@ -2142,6 +2147,7 @@ def case_variants(old, new):
         return s[:1].upper() + s[1:] if s else s
 
     forms = [
+        (old, new),                  # EXACTLY as typed — matches mixed case like "Browse by Products"
         (o, n),                      # lower:    myanmar -> india
         (o.upper(), n.upper()),      # UPPER:    MYANMAR -> INDIA
         (title(o), title(n)),        # Title:    Myanmar -> India (each word / slug part)
