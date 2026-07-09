@@ -2186,21 +2186,33 @@ def _url_forms(o):
     return forms
 
 
+def _slug_case_variants(form):
+    """lower, UPPER and Title-Each-Word variants of a slug form, so a filename
+    written as 'New-Zealand' (or 'NEW-ZEALAND') is matched even though the match
+    is case-sensitive."""
+    return {form, form.upper(),
+            re.sub(r"[A-Za-z]+", lambda m: m.group(0).capitalize(), form)}
+
+
 def _url_slug_pairs(pairs):
     """Bounded (-, _, /, .) variants that match the search term *inside a URL or
-    media filename* — in hyphen, spaced, OR underscore form — and replace it with
-    the URL slug of NEW. This works in both directions:
-      india -> United States :  …-india.jpg          -> …-united-states.jpg
-      United States -> India :  …-united-states.jpg  -> …-india.jpg
-                                …-united states.jpg  -> …-india.jpg   (fixes old bug)
+    media filename* — in hyphen, spaced, or underscore form, and in any letter
+    case — and replace it with the URL slug of NEW. Works in both directions:
+      india -> United States :  …-india.jpg           -> …-united-states.jpg
+      New Zealand -> India   :  …-New-Zealand.jpg      -> …-india.jpg
+                                …-new-zealand.jpg      -> …-india.jpg
+                                …-new zealand.jpg      -> …-india.jpg   (fixes old bug)
     The boundaries keep these from ever matching prose."""
     out, seen = [], set()
     for o, n in pairs:
         sn = slugify(n)
         if not sn:
             continue
-        for fo in _url_forms(o):
-            if fo == sn:
+        forms = set()
+        for base in _url_forms(o):
+            forms |= _slug_case_variants(base)
+        for fo in forms:
+            if fo.lower() == sn:
                 continue
             for L in _SLUG_SEP_L:
                 for R in _SLUG_SEP_R:
@@ -2491,16 +2503,20 @@ def rename_media(cfg, pairs, apply=False, smart_case=False):
     """Rename media files whose name contains the search term, so URLs rewritten
     by search-replace still resolve. The scan and the renames run in a single
     server-side PHP pass (fast even for tens of thousands of files)."""
-    # Filenames are URL slugs, so rename any old form of the term (hyphen slug,
-    # spaced, or underscore) to the slug of NEW — e.g. 'united-states.jpg' AND a
-    # left-over 'united states.jpg' both become 'india.jpg'.
+    # Filenames are URL slugs, so rename any form of the term (hyphen slug,
+    # spaced, or underscore — in any letter case) to the slug of NEW. e.g.
+    # 'Bars-in-New-Zealand.jpg' AND 'bars-in-new zealand.jpg' both become
+    # '…-india.jpg'.
     slug_pairs, seen = [], set()
     for o, n in pairs:
         sn = slugify(n)
         if not sn:
             continue
-        for fo in _url_forms(o):
-            if fo != sn and fo not in seen:
+        forms = set()
+        for base in _url_forms(o):
+            forms |= _slug_case_variants(base)
+        for fo in forms:
+            if fo.lower() != sn and fo not in seen:
                 seen.add(fo)
                 slug_pairs.append((fo, sn))
     if not slug_pairs:
