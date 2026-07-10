@@ -137,6 +137,130 @@ def has_link_tokens(text):
     return bool(text) and (_TOK_OPEN + "L") in text
 
 
+# --------------------------------------------------------------------------
+# Reply safety guard: weak models sometimes leak their own reasoning ("Wait — I
+# need to preserve the marker…"), echo the instructions, invent text, or drop /
+# duplicate / narrate the protection markers. Any such reply is REJECTED so the
+# caller keeps the original block unchanged — a paragraph is never overwritten
+# with garbage.
+# --------------------------------------------------------------------------
+_LEAK_RE = re.compile(
+    r"(return only the|as an ai\b|i (?:need|have|want) to (?:preserve|keep|return|rewrite)|"
+    r"here(?: is|'s) the (?:rewritten|new|updated|revised)|"
+    r"(?:preserve|keep|restore|retain) the (?:marker|token|tag|placeholder|formatting)|"
+    r"the (?:marker|token|placeholder) (?:for|is|represents|should)|"
+    r"\bwait[,\u2014-]|note to self|let me (?:rewrite|preserve|keep|make)|"
+    r"i'?ll (?:keep|preserve|rewrite|make) th|rewritten (?:content|version) below)",
+    re.I)
+
+
+def reply_is_clean(reply, n_links, original_masked=""):
+    """True if the model's reply is safe to write: no leaked reasoning / echoed
+    instructions, no stray backtick artifacts, and the ⟦Ln⟧ markers are all
+    present exactly once (none dropped, duplicated, invented, or out of range)."""
+    if reply is None:
+        return False
+    r = reply.strip()
+    if not r:
+        return False
+    if _LEAK_RE.search(r):
+        return False
+    if "`" in r and "`" not in (original_masked or ""):
+        return False
+    idxs = [int(m) for m in re.findall(_TOK_OPEN + r"L(\d+)" + _TOK_CLOSE, r)]
+    if n_links:
+        if sorted(idxs) != list(range(n_links)):
+            return False
+    elif idxs:                      # invented a marker that never existed
+        return False
+    return True
+
+
+def accept_reply(reply, links, original_masked=""):
+    """Validate + restore a model reply. Returns (text, True) if safe to write,
+    else (None, False) so the caller keeps the original block unchanged."""
+    if not reply_is_clean(reply, len(links), original_masked):
+        return None, False
+    restored, ok = restore_links(reply.strip(), links)
+    if links and not ok:
+        return None, False
+    return restored, True
+
+
+# A leading bold "label:" on a block (common in list items:
+# "<strong>Enquiry Forwarding:</strong><br>Once we receive…") is kept as LITERAL
+# HTML and never turned into a marker, so the model can't move it or narrate it —
+# only the sentence after it is rewritten.
+_LEADING_LABEL_RE = re.compile(
+    r"(?is)^\s*(<(?:strong|b)\b[^>]*>.*?</(?:strong|b)>)\s*(<br\s*/?>)?\s*(.+)$")
+
+
+def split_leading_label(inner_html):
+    """If a block starts with a bold label (optionally + <br>), return
+    (label_html_prefix, rest_html); otherwise (None, inner_html)."""
+    m = _LEADING_LABEL_RE.match(inner_html or "")
+    if m and m.group(3).strip() and re.search(r"[^\W\d_]", re.sub(r"<[^>]+>", " ", m.group(3))):
+        return m.group(1) + (m.group(2) or ""), m.group(3)
+    return None, inner_html
+
+
+# Split after . ! ? + whitespace, whether the next word is Capital OR lowercase
+# (many rewrites continue in lowercase). Guard against common abbreviations and
+# single-letter initials so "Mr. smith" / "e.g. foo" / "J. doe" don't split, and
+# decimals like "3.5" have no space so they're safe. ⟦Ln⟧ tokens have no sentence
+# punctuation, so protected links/bold are never cut.
+_ABBR = ["Mr", "Mrs", "Ms", "Dr", "St", "vs", "etc", "No", "Inc", "Ltd", "Co",
+         "Jr", "Sr", "Fig", "Vol", "pp", "Ave", "Rd", "Pvt"]
+_SENT_SPLIT_RE = re.compile(
+    "".join(r"(?<!\b%s\.)" % a for a in _ABBR)
+    + r"(?<!\b[A-Za-z]\.)"           # single-letter initial: "J." / "a."
+    + r"(?<![A-Za-z]\.[A-Za-z]\.)"   # 2-letter abbr: "e.g." / "i.e." / "U.S."
+    + r"(?<=[.!?])\s+"
+    + r"(?=[\"'(\u201c\u2018]?[A-Za-z0-9\u27e6])"
+)
+
+
+def word_count(masked):
+    """Word count of masked text; each ⟦Ln⟧ token counts as one word."""
+    return len((masked or "").split())
+
+
+def split_into_paras(masked, max_words):
+    """Group the sentences of `masked` into chunks each roughly <= max_words words,
+    never cutting a sentence. Splits after . ! ? in either case. If a chunk is a
+    run-on far over the limit (no usable sentence breaks), it's hard-wrapped at a
+    word boundary as a last resort (never through a ⟦Ln⟧ token). Returns >=1 chunk."""
+    text = (masked or "").strip()
+    if not text:
+        return []
+    sentences = [s.strip() for s in _SENT_SPLIT_RE.split(text) if s.strip()]
+    chunks, cur, cw = [], [], 0
+    for s in sentences:
+        w = len(s.split())
+        if cur and cw + w > max_words:
+            chunks.append(" ".join(cur))
+            cur, cw = [], 0
+        cur.append(s)
+        cw += w
+    if cur:
+        chunks.append(" ".join(cur))
+    # any chunk still over the limit is a single over-long sentence / run-on with
+    # no usable breaks — split it into balanced parts at word boundaries (a ⟦Ln⟧
+    # token is one word, so it's never cut).
+    out = []
+    for ch in chunks:
+        words = ch.split()
+        n = len(words)
+        if n > max_words:
+            parts = (n + max_words - 1) // max_words
+            size = (n + parts - 1) // parts
+            for i in range(0, n, size):
+                out.append(" ".join(words[i:i + size]))
+        else:
+            out.append(ch)
+    return out if len(out) > 1 else [text]
+
+
 def node_inner_html(node):
     """Inner HTML of an lxml element (its text plus serialized children)."""
     parts = [node.text or ""]

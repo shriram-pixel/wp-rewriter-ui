@@ -12,7 +12,9 @@ expose it on a public interface.
 import json
 
 import os
+import csv
 import threading
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 
 try:
@@ -196,6 +198,28 @@ def _unregister_job(job_id):
         _rewrite_stops.pop(job_id, None)
 
 
+# --- per-run report -------------------------------------------------------
+# Each AI-rewrite run writes a CSV (page id, title, status, time) into
+# ./reports, updated after every page — so if the run stops or the tab is
+# closed, the file still shows exactly what finished and what's still pending.
+_REPORTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reports")
+
+
+def _write_report(path, report, dry_run):
+    tmp = path + ".tmp"
+    with open(tmp, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["page_id", "title", "status", "time"])
+        for pid, r in report.items():
+            w.writerow([pid, r["title"], r["status"], r["time"]])
+    os.replace(tmp, path)
+
+
+def _new_report_path():
+    os.makedirs(_REPORTS_DIR, exist_ok=True)
+    return os.path.join(_REPORTS_DIR, "rewrite-%s.csv" % datetime.now().strftime("%Y%m%d-%H%M%S"))
+
+
 @app.route("/api/rewrite/stop", methods=["POST"])
 def api_rewrite_stop():
     data = request.get_json(force=True) or {}
@@ -239,6 +263,19 @@ def api_rewrite():
         except Exception as exc:  # noqa: BLE001
             yield json.dumps({"event": "error", "message": "Reading posts failed: " + str(exc)}) + "\n"
             return
+
+        # start the run report: every selected page begins as "pending"
+        report = {}
+        for pid in ids:
+            p = posts.get(pid) or {}
+            title = (p.get("title") or "").strip() or ("#%d" % pid)
+            report[pid] = {"title": title, "status": "pending", "time": ""}
+        report_path = _new_report_path()
+        try:
+            _write_report(report_path, report, dry_run)
+            yield json.dumps({"event": "report", "path": report_path}) + "\n"
+        except Exception:  # noqa: BLE001
+            report_path = None
 
         def work(pid):
             post = posts.get(pid)
@@ -292,6 +329,13 @@ def api_rewrite():
                             else:
                                 updates[pid] = {"type": "content", "value": res["content"]}
                     counts[status] = counts.get(status, 0) + 1
+                    if report_path and pid in report:
+                        report[pid]["status"] = status
+                        report[pid]["time"] = datetime.now().strftime("%H:%M:%S")
+                        try:
+                            _write_report(report_path, report, dry_run)
+                        except Exception:  # noqa: BLE001
+                            pass
                     b = res.get("_builder")
                     where = (" (%s)" % b) if (b and b != "classic") else ""
                     yield json.dumps({"event": "post", "id": pid, "status": status,
@@ -313,7 +357,7 @@ def api_rewrite():
                 yield json.dumps({"event": "written", "count": wres["count"]}) + "\n"
 
         yield json.dumps({"event": "done", "counts": counts, "stopped": stopped,
-                          "not_started": not_started}) + "\n"
+                          "not_started": not_started, "report": report_path}) + "\n"
 
     def stream_wrapped():
         try:

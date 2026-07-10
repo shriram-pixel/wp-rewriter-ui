@@ -5,6 +5,7 @@ config.ini
 .venv/
 venv/
 __pycache__/
+reports/
 *.pyc
 
 # OS junk

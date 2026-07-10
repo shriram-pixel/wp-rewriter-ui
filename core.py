@@ -942,9 +942,9 @@ def _process_beaver(cfg, post, rows, placeholders):
                 prompt += "\n\n" + builders.LINK_HINT
             reply = ai_complete(cfg, prompt)
             if reply is not None:
-                restored, ok = builders.restore_links(reply, links)
-                if links and not ok:
-                    continue  # keep original rather than drop a link
+                restored, ok = builders.accept_reply(reply, links, masked)
+                if not ok:
+                    continue  # leaked reasoning / dropped token — keep original
                 edits.append({"node": nd["node"], "field": nd["field"], "value": restored})
                 done.add(key)
     if not edits:
@@ -1045,9 +1045,9 @@ def process_one(cfg, post, rows, placeholders):
             reply = ai_complete(cfg, prompt)
             if reply is None:
                 continue
-            restored, ok = builders.restore_links(reply, links)
-            if links and not ok:
-                continue  # a link token was dropped — leave this node as-is
+            restored, ok = builders.accept_reply(reply, links, masked)
+            if not ok:
+                continue  # leaked reasoning / dropped token — leave this node as-is
             set_node_content(node, restored)
             changed = True
         if not changed:
@@ -1813,6 +1813,82 @@ def elementor_types_from_xpath(xpath):
     return None
 
 
+def _is_multipara_html(text):
+    """True if the value is block-structured HTML (paragraphs/lists/headings) —
+    the kind whose structure must be preserved, not a one-line heading field."""
+    return bool(text) and bool(re.search(r"<(p|ol|ul|li|h[1-6])\b", text, re.I))
+
+
+def _rewrite_structure(cfg, html, prompt_tpl, title, placeholders, max_words=120):
+    """Rewrite a block-structured HTML field while PRESERVING its structure:
+    each block-level element (<p>, <li>, heading) is rewritten separately so
+    paragraphs are never merged, and a top-level <p> whose rewrite exceeds
+    max_words is split into several <p> at sentence boundaries. Bold/strong/link
+    runs stay protected, breadcrumbs are skipped. Returns (new_html, n_changed)."""
+    import builders
+    root = builders._load_root(html)
+    changed = 0
+    blocks = []
+    for el in root.iter():
+        tag = getattr(el, "tag", None)
+        if not isinstance(tag, str):
+            continue
+        t = tag.lower()
+        if t in ("p", "h1", "h2", "h3", "h4", "h5", "h6"):
+            blocks.append(el)
+        elif t == "li" and not any(
+                isinstance(c.tag, str) and c.tag.lower() in
+                ("p", "h1", "h2", "h3", "h4", "h5", "h6", "ul", "ol") for c in el):
+            blocks.append(el)
+    for el in blocks:
+        inner = builders.node_inner_html(el)
+        if not re.search(r"[^\W\d_]", re.sub(r"<[^>]+>", " ", inner)):
+            continue                                   # no real letters to rewrite
+        if builders.is_breadcrumb(inner):
+            continue                                   # never rewrite breadcrumbs
+
+        # keep a leading bold "Label:" (list items) as literal HTML — rewrite only
+        # the sentence after it, so the model can't move or narrate the label.
+        label_prefix, body = builders.split_leading_label(inner)
+
+        masked, links = builders.mask_links_inplace(body)
+        prompt = render_prompt(prompt_tpl, None, title, placeholders, current_text=masked)
+        if builders.has_link_tokens(masked):
+            prompt += "\n\n" + builders.LINK_HINT
+        reply = ai_complete(cfg, prompt)
+
+        # GUARD: reject leaked reasoning / mangled markers -> keep original block
+        restored, ok = builders.accept_reply(reply, links, masked)
+        if not ok:
+            continue
+
+        top_level_p = (el.tag.lower() == "p" and el.getparent() is root
+                       and label_prefix is None)
+        if top_level_p and builders.word_count(reply) > max_words:
+            chunks = builders.split_into_paras(reply.strip(), max_words)
+            if len(chunks) > 1:
+                # full reply already passed the guard above; each chunk holds a
+                # subset of markers, so just restore per chunk.
+                parent = el.getparent()
+                idx = list(parent).index(el)
+                new_nodes = []
+                for ch in chunks:
+                    rr, _ = builders.restore_links(ch, links)
+                    p = builders._lh.fromstring("<p>x</p>")
+                    builders._set_node_content(p, rr)
+                    new_nodes.append(p)
+                for j, node in enumerate(new_nodes):
+                    parent.insert(idx + j, node)
+                parent.remove(el)
+                changed += 1
+                continue
+
+        new_inner = (label_prefix or "") + restored
+        builders._set_node_content(el, new_inner)
+        changed += 1
+    return builders.node_inner_html(root), changed
+
+
 def process_one_elementor(cfg, post, specs, placeholders):
     """Rewrite text inside an Elementor page's widgets. `specs` is a list of
     {prompt, allowed, index} — one per XPath/prompt row — applied in order to the
@@ -1863,6 +1939,14 @@ def process_one_elementor(cfg, post, specs, placeholders):
                 text = settings.get(field)
                 if not isinstance(text, str) or not text.strip():
                     continue
+                if _is_multipara_html(text):
+                    # keep paragraph structure; split >120-word paragraphs
+                    new_html, n = _rewrite_structure(cfg, text, prompt_tpl, title, placeholders)
+                    if n:
+                        settings[field] = new_html
+                        done.add(key)
+                        count += 1
+                    continue
                 masked, links = builders.mask_links_inplace(text)
                 prompt = render_prompt(prompt_tpl, None, title, placeholders,
                                        current_text=masked)
@@ -1870,9 +1954,9 @@ def process_one_elementor(cfg, post, specs, placeholders):
                     prompt += "\n\n" + builders.LINK_HINT
                 reply = ai_complete(cfg, prompt)
                 if reply is not None:
-                    restored, ok = builders.restore_links(reply, links)
-                    if links and not ok:
-                        continue  # a link token was dropped — keep original
+                    restored, ok = builders.accept_reply(reply, links, masked)
+                    if not ok:
+                        continue  # leaked reasoning / dropped token — keep original
                     settings[field] = restored
                     done.add(key)
                     count += 1

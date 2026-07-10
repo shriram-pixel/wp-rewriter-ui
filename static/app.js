@@ -2,9 +2,13 @@
 
 // Default AI-rewrite prompt (pre-filled into every XPath row; editable per row).
 const DEFAULT_PROMPT =
-  "Rewrite the following, keeping the same meaning and tone.\n" +
-  "Preserve any HTML tags and formatting intact.\n" +
-  "Return only the rewritten content, nothing else:\n" +
+  "Rewrite the text below, keeping the same meaning, facts, and tone.\n" +
+  "Rules:\n" +
+  "- Do NOT add, invent, or change any facts, names, companies, people, numbers, or contact details. Keep every proper name exactly as written.\n" +
+  "- Do NOT add new sentences or information that is not in the original.\n" +
+  "- Preserve all HTML tags and formatting exactly as they appear.\n" +
+  "- Output ONLY the rewritten text, with no notes or commentary.\n\n" +
+  "Text:\n" +
   "{{text}}";
 
 const $ = (s, r = document) => r.querySelector(s);
@@ -564,6 +568,8 @@ $("#runRewrite").addEventListener("click", async () => {
       if (ev.event === "start") {
         total = ev.total;
         appendLog(`Starting ${ev.dry_run ? "preview" : "rewrite"} of ${total} post(s)…`, "muted");
+      } else if (ev.event === "report") {
+        if (ev.path) appendLog(`Run report: ${ev.path} (updated after each page)`, "muted");
       } else if (ev.event === "post") {
         processed++;
         counts[ev.status] = (counts[ev.status] || 0) + 1;
@@ -587,6 +593,7 @@ $("#runRewrite").addEventListener("click", async () => {
           appendLog(`\nFinished: ${c.updated} updated, ${c.skipped} skipped, ${c.error} errors.`, "muted");
         }
         appendLog("If the live site uses a persistent or page cache, purge it.", "muted");
+        if (ev.report) appendLog(`Report saved: ${ev.report}`, "muted");
       } else if (ev.event === "error") {
         appendLog(ev.message, "err");
       }
