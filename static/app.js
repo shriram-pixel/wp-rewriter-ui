@@ -2,12 +2,16 @@
 
 // Default AI-rewrite prompt (pre-filled into every XPath row; editable per row).
 const DEFAULT_PROMPT =
-  "Rewrite the text below, keeping the same meaning, facts, and tone.\n" +
+  "Rewrite the text below while preserving its original meaning, facts, tone, and structure.\n" +
   "Rules:\n" +
-  "- Do NOT add, invent, or change any facts, names, companies, people, numbers, or contact details. Keep every proper name exactly as written.\n" +
-  "- Do NOT add new sentences or information that is not in the original.\n" +
-  "- Preserve all HTML tags and formatting exactly as they appear.\n" +
-  "- Output ONLY the rewritten text, with no notes or commentary.\n\n" +
+  "- Do NOT add, remove, invent, infer, or change any facts.\n" +
+  "- Do NOT change any names, companies, people, products, trademarks, numbers, dates, URLs, email addresses, phone numbers, or contact details. Keep every proper noun exactly as written.\n" +
+  "- Preserve all HTML tags, attributes, entities, whitespace, and formatting exactly as they appear.\n" +
+  "- Rewrite only the natural language text.\n" +
+  "- Do NOT summarize, expand, simplify, or reorder the content unless required for grammar or readability.\n" +
+  "- If any part of the text is ambiguous, leave it unchanged rather than guessing.\n" +
+  "- If a sentence cannot be safely rewritten without changing its meaning, keep it exactly as it is.\n" +
+  "- Output ONLY the rewritten text. Do not include explanations, notes, or markdown.\n" +
   "Text:\n" +
   "{{text}}";
 
