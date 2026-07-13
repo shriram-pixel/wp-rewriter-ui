@@ -162,7 +162,10 @@ def api_replace():
         media = core.rename_media(cfg, pairs, apply, smart_case=smart)
         report += "\n\n──────── media files ────────\n" + media["report"]
         rc = rc or media["rc"]
-    return jsonify({"ok": rc == 0, "report": report, "rc": rc})
+    report_file = _write_replace_report(pairs, report, rc, apply)
+    if report_file:
+        report += "\n\nReport saved: " + report_file
+    return jsonify({"ok": rc == 0, "report": report, "rc": rc, "report_file": report_file})
 
 
 @app.route("/api/preview", methods=["POST"])
@@ -218,6 +221,34 @@ def _write_report(path, report, dry_run):
 def _new_report_path():
     os.makedirs(_REPORTS_DIR, exist_ok=True)
     return os.path.join(_REPORTS_DIR, "rewrite-%s.csv" % datetime.now().strftime("%Y%m%d-%H%M%S"))
+
+
+def _write_replace_report(pairs, report_text, rc, applied):
+    """Write a Find & Replace report: time (no date), the find/replace changes,
+    the run's replacement count, and completed / failed / preview status.
+    Returns the file path (or None on failure)."""
+    # pull the total replacement count out of the run's "Total: N replacement(s)" line
+    total = ""
+    for line in (report_text or "").splitlines():
+        if line.strip().startswith("Total:"):
+            total = "".join(ch for ch in line.split("replacement")[0] if ch.isdigit())
+            break
+    status = "failed" if rc != 0 else ("completed" if applied else "preview")
+    t = datetime.now().strftime("%H:%M:%S")
+    try:
+        os.makedirs(_REPORTS_DIR, exist_ok=True)
+        base = os.path.join(_REPORTS_DIR, "replace-%s" % t.replace(":", ""))
+        path, i = base + ".csv", 2
+        while os.path.exists(path):           # time-only names: avoid overwriting
+            path, i = "%s-%d.csv" % (base, i), i + 1
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["time", "find", "replace", "replacements_this_run", "status"])
+            for o, n in pairs:
+                w.writerow([t, o, n, total, status])
+        return path
+    except Exception:  # noqa: BLE001
+        return None
 
 
 @app.route("/api/rewrite/stop", methods=["POST"])
