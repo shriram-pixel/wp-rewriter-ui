@@ -138,6 +138,64 @@ def has_link_tokens(text):
 
 
 # --------------------------------------------------------------------------
+# Block batching: send every block of a field in ONE call. Each block is wrapped
+# in ⟦Pn⟧…⟦/Pn⟧ markers (not JSON — quotes, tags and commas in the HTML can't
+# break this format). The reply is parsed per marker, so a block that comes back
+# missing or broken simply keeps its ORIGINAL text while the rest still update.
+# --------------------------------------------------------------------------
+BLOCK_HINT = (
+    "The text is split into blocks, each wrapped in numbered markers of the form " +
+    _TOK_OPEN + "Pn" + _TOK_CLOSE + " … " + _TOK_OPEN + "/Pn" + _TOK_CLOSE +
+    " (n is the block number). Rewrite ONLY the text inside each block. Return every "
+    "block in the same form, with the same marker numbers, in the same order, and "
+    "write nothing outside the markers. Do not merge, split, drop, reorder, or "
+    "renumber the blocks.")
+
+_BLK_RE = re.compile(
+    _TOK_OPEN + r"P(\d+)" + _TOK_CLOSE + r"(.*?)" + _TOK_OPEN + r"/P\1" + _TOK_CLOSE, re.S)
+_FENCE_RE = re.compile(r"^\s*```[a-zA-Z]*\s*|\s*```\s*$")
+
+
+def shift_tokens(masked, offset):
+    """Renumber ⟦Ln⟧ tokens by +offset, so tokens are unique across a batch."""
+    if not offset:
+        return masked
+    return _TOK_RE.sub(
+        lambda m: _TOK_OPEN + "L" + str(int(m.group(1)) + offset) + _TOK_CLOSE, masked)
+
+
+def unshift_tokens(text, offset):
+    """Renumber ⟦Ln⟧ tokens by -offset, back to a block's own 0-based numbering."""
+    if not offset:
+        return text
+    return _TOK_RE.sub(
+        lambda m: _TOK_OPEN + "L" + str(int(m.group(1)) - offset) + _TOK_CLOSE, text)
+
+
+def wrap_blocks(texts):
+    """Wrap each text in ⟦Pn⟧…⟦/Pn⟧ markers (n is 1-based)."""
+    return "\n\n".join(
+        "%sP%d%s%s%s/P%d%s" % (_TOK_OPEN, i + 1, _TOK_CLOSE, t, _TOK_OPEN, i + 1, _TOK_CLOSE)
+        for i, t in enumerate(texts))
+
+
+def parse_blocks(reply):
+    """Pull ⟦Pn⟧…⟦/Pn⟧ blocks out of a reply -> {n: text}. Tolerates a code fence
+    or chatter around the markers. A duplicated block number is ambiguous, so the
+    whole reply is rejected ({}); a missing one just won't be in the dict."""
+    if not reply:
+        return {}
+    r = _FENCE_RE.sub("", reply.strip())
+    out = {}
+    for m in _BLK_RE.finditer(r):
+        n = int(m.group(1))
+        if n in out:
+            return {}                      # same block twice — don't guess
+        out[n] = m.group(2).strip()
+    return out
+
+
+# --------------------------------------------------------------------------
 # Reply safety guard: weak models sometimes leak their own reasoning ("Wait — I
 # need to preserve the marker…"), echo the instructions, invent text, or drop /
 # duplicate / narrate the protection markers. Any such reply is REJECTED so the

@@ -1819,15 +1819,24 @@ def _is_multipara_html(text):
     return bool(text) and bool(re.search(r"<(p|ol|ul|li|h[1-6])\b", text, re.I))
 
 
+def _visible_word_count(masked):
+    """Words a reader actually sees: HTML tags stripped, each ⟦Ln⟧ marker (a
+    protected link/bold run) counted as one word."""
+    return len(re.sub(r"<[^>]+>", " ", masked or "").split())
+
+
 def _rewrite_structure(cfg, html, prompt_tpl, title, placeholders, max_words=120):
-    """Rewrite a block-structured HTML field while PRESERVING its structure:
-    each block-level element (<p>, <li>, heading) is rewritten separately so
-    paragraphs are never merged, and a top-level <p> whose rewrite exceeds
-    max_words is split into several <p> at sentence boundaries. Bold/strong/link
-    runs stay protected, breadcrumbs are skipped. Returns (new_html, n_changed)."""
+    """Rewrite a block-structured HTML field while PRESERVING its structure.
+    Every block (<p>, <li>, heading) goes to the AI in a SINGLE call, each wrapped
+    in ⟦Pn⟧…⟦/Pn⟧ markers, so a page costs one call instead of one per paragraph.
+    Each block is validated on the way back: a block that is missing, duplicated,
+    or fails the leak guard keeps its ORIGINAL text while the others still update,
+    so structure can never break. Paragraphs are never merged, and a top-level <p>
+    whose rewrite exceeds max_words is split at sentence boundaries. Bold/strong/
+    link runs stay protected; breadcrumbs are skipped.
+    Returns (new_html, n_changed, n_kept_original)."""
     import builders
     root = builders._load_root(html)
-    changed = 0
     blocks = []
     for el in root.iter():
         tag = getattr(el, "tag", None)
@@ -1840,31 +1849,73 @@ def _rewrite_structure(cfg, html, prompt_tpl, title, placeholders, max_words=120
                 isinstance(c.tag, str) and c.tag.lower() in
                 ("p", "h1", "h2", "h3", "h4", "h5", "h6", "ul", "ol") for c in el):
             blocks.append(el)
+
+    # Prepare each block: skip empties/breadcrumbs, keep a leading bold label
+    # literal, and protect links/bold as ⟦Ln⟧ tokens.
+    items = []
     for el in blocks:
         inner = builders.node_inner_html(el)
         if not re.search(r"[^\W\d_]", re.sub(r"<[^>]+>", " ", inner)):
             continue                                   # no real letters to rewrite
         if builders.is_breadcrumb(inner):
             continue                                   # never rewrite breadcrumbs
-
-        # keep a leading bold "Label:" (list items) as literal HTML — rewrite only
-        # the sentence after it, so the model can't move or narrate the label.
         label_prefix, body = builders.split_leading_label(inner)
-
         masked, links = builders.mask_links_inplace(body)
-        prompt = render_prompt(prompt_tpl, None, title, placeholders, current_text=masked)
-        if builders.has_link_tokens(masked):
+        items.append({"el": el, "label": label_prefix, "masked": masked,
+                      "links": links, "offset": 0})
+    if not items:
+        return builders.node_inner_html(root), 0, 0
+
+    replies = {}
+    if len(items) == 1:
+        # single block — no markers needed, keep the plain one-shot prompt
+        it = items[0]
+        prompt = render_prompt(prompt_tpl, None, title, placeholders,
+                               current_text=it["masked"])
+        if builders.has_link_tokens(it["masked"]):
             prompt += "\n\n" + builders.LINK_HINT
         reply = ai_complete(cfg, prompt)
+        if reply is not None:
+            replies[0] = reply
+    else:
+        # ONE call for the whole field. Token numbers are shifted so ⟦L0⟧ can't
+        # mean two different things across blocks in the same prompt.
+        offset, shown = 0, []
+        for it in items:
+            it["offset"] = offset
+            shown.append(builders.shift_tokens(it["masked"], offset))
+            offset += len(it["links"])
+        prompt = render_prompt(prompt_tpl, None, title, placeholders,
+                               current_text=builders.wrap_blocks(shown))
+        prompt += "\n\n" + builders.BLOCK_HINT
+        if offset:
+            prompt += "\n\n" + builders.LINK_HINT
+        got = builders.parse_blocks(ai_complete(cfg, prompt))
+        for i, it in enumerate(items):
+            raw = got.get(i + 1)
+            if raw is None:
+                continue                               # block missing — keep original
+            replies[i] = builders.unshift_tokens(raw, it["offset"])
 
+    changed = 0
+    kept = 0
+    for i, it in enumerate(items):
+        reply = replies.get(i)
+        if reply is None:
+            kept += 1                                  # block missing from the reply
+            continue
+        el, links, masked, label_prefix = it["el"], it["links"], it["masked"], it["label"]
         # GUARD: reject leaked reasoning / mangled markers -> keep original block
         restored, ok = builders.accept_reply(reply, links, masked)
         if not ok:
+            kept += 1                                  # reply rejected for this block
             continue
-
         top_level_p = (el.tag.lower() == "p" and el.getparent() is root
                        and label_prefix is None)
-        if top_level_p and builders.word_count(reply) > max_words:
+        # Split only a paragraph that was ALREADY too long in the ORIGINAL. The
+        # rewrite's own length must not decide this: a 115-word source whose
+        # rewrite happens to come back at 124 words stays ONE paragraph.
+        if top_level_p and _visible_word_count(masked) > max_words:
             chunks = builders.split_into_paras(reply.strip(), max_words)
             if len(chunks) > 1:
                 # full reply already passed the guard above; each chunk holds a
@@ -1882,11 +1933,9 @@ def _rewrite_structure(cfg, html, prompt_tpl, title, placeholders, max_words=120
                 parent.remove(el)
                 changed += 1
                 continue
-
-        new_inner = (label_prefix or "") + restored
-        builders._set_node_content(el, new_inner)
+        builders._set_node_content(el, (label_prefix or "") + restored)
         changed += 1
-    return builders.node_inner_html(root), changed
+    return builders.node_inner_html(root), changed, kept
 
 
 def process_one_elementor(cfg, post, specs, placeholders):
@@ -1903,6 +1952,8 @@ def process_one_elementor(cfg, post, specs, placeholders):
     title = post.get("title", "")
     done = set()            # (id(settings), field) already rewritten on this page
     count = 0
+    kept_total = 0     # blocks that kept their ORIGINAL text (reply missing/rejected)
+    attempted = 0      # blocks/fields actually sent to the AI
     matched_any = False
     indexed = False
     # If any row targets a heading level, read the live page's real heading tags
@@ -1941,7 +1992,9 @@ def process_one_elementor(cfg, post, specs, placeholders):
                     continue
                 if _is_multipara_html(text):
                     # keep paragraph structure; split >120-word paragraphs
-                    new_html, n = _rewrite_structure(cfg, text, prompt_tpl, title, placeholders)
+                    new_html, n, k = _rewrite_structure(cfg, text, prompt_tpl, title, placeholders)
+                    attempted += n + k
+                    kept_total += k
                     if n:
                         settings[field] = new_html
                         done.add(key)
@@ -1952,10 +2005,12 @@ def process_one_elementor(cfg, post, specs, placeholders):
                                        current_text=masked)
                 if builders.has_link_tokens(masked):
                     prompt += "\n\n" + builders.LINK_HINT
+                attempted += 1
                 reply = ai_complete(cfg, prompt)
                 if reply is not None:
                     restored, ok = builders.accept_reply(reply, links, masked)
                     if not ok:
+                        kept_total += 1
                         continue  # leaked reasoning / dropped token — keep original
                     settings[field] = restored
                     done.add(key)
@@ -1964,10 +2019,18 @@ def process_one_elementor(cfg, post, specs, placeholders):
         return {"status": "error", "message": str(exc).replace("\n", " ")}
     if not count:
         if not matched_any and indexed:
-            return {"status": "skipped",
+            return {"status": "skipped", "kept": kept_total,
                     "message": "no widget at the requested index on this page"}
-        return {"status": "skipped", "message": "no matching text widgets"}
-    return {"status": "updated", "message": "%d widget(s)" % count,
+        if attempted:
+            # text WAS sent to the AI but every reply was rejected — say so plainly
+            return {"status": "skipped", "kept": kept_total,
+                    "message": "AI reply rejected \u2014 page left unchanged"}
+        return {"status": "skipped", "kept": kept_total,
+                "message": "no matching text widgets"}
+    msg = "%d widget(s)" % count
+    if kept_total:
+        msg += "; %d paragraph(s) kept original" % kept_total
+    return {"status": "updated", "message": msg, "kept": kept_total,
             "elementor": json.dumps(data, ensure_ascii=False)}
 
 

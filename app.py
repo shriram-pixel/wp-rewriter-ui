@@ -212,9 +212,9 @@ def _write_report(path, report, dry_run):
     tmp = path + ".tmp"
     with open(tmp, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["page_id", "title", "status", "time"])
+        w.writerow(["page_id", "title", "status", "time", "note"])
         for pid, r in report.items():
-            w.writerow([pid, r["title"], r["status"], r["time"]])
+            w.writerow([pid, r["title"], r["status"], r["time"], r.get("note", "")])
     os.replace(tmp, path)
 
 
@@ -300,7 +300,7 @@ def api_rewrite():
         for pid in ids:
             p = posts.get(pid) or {}
             title = (p.get("title") or "").strip() or ("#%d" % pid)
-            report[pid] = {"title": title, "status": "pending", "time": ""}
+            report[pid] = {"title": title, "status": "pending", "time": "", "note": ""}
         report_path = _new_report_path()
         try:
             _write_report(report_path, report, dry_run)
@@ -363,6 +363,12 @@ def api_rewrite():
                     if report_path and pid in report:
                         report[pid]["status"] = status
                         report[pid]["time"] = datetime.now().strftime("%H:%M:%S")
+                        kept = res.get("kept") or 0
+                        if kept and status in ("updated", "preview"):
+                            report[pid]["note"] = ("%d paragraph(s) kept original "
+                                                   "(AI reply rejected) \u2014 re-run to retry" % kept)
+                        elif status in ("skipped", "error"):
+                            report[pid]["note"] = res.get("message", "")
                         try:
                             _write_report(report_path, report, dry_run)
                         except Exception:  # noqa: BLE001
