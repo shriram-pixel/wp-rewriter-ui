@@ -158,6 +158,13 @@
           </label>
           <button id="loadPosts" class="btn" style="margin-left:0">Load posts</button>
         </div>
+        <div class="reprow">
+          <button type="button" id="uploadReportBtn" class="btn btn--ghost">Upload last updated page report</button>
+          <input type="file" id="reportFile" accept=".csv" hidden>
+          <button type="button" id="clearReportBtn" class="btn btn--ghost btn--sm" hidden>Clear</button>
+          <div class="hint">Optional — skips pages already rewritten in that report. All other pages are rewritten.</div>
+          <div id="reportInfo" class="res" hidden></div>
+        </div>
         <div id="postList" class="checklist" hidden></div>
       </div>
 

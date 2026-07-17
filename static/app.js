@@ -315,6 +315,36 @@ function builderBadge(key) {
   return `<span class="bdg bdg--${escapeAttr(key)}">${escapeHtml(label)}</span> `;
 }
 
+// Pages already rewritten, read from an uploaded run report — they are skipped.
+let reportDone = new Set();
+let reportCarry = [];   // full "updated" rows from an uploaded report, carried into the next one
+let lastPosts = [];
+
+function renderPostList() {
+  const box = $("#postList");
+  if (!lastPosts.length) return;
+  const done = lastPosts.filter((p) => reportDone.has(p.id)).length;
+  const head =
+    `<div class="selrow"><strong>${lastPosts.length} ${lastPosts.length === 1 ? "page" : "pages"} loaded</strong>` +
+    (done ? ` · <span class="meta">${done} already updated (skipped)</span>` : "") +
+    ` · <span id="selCount">none selected</span> <button type="button" class="btn btn--ghost btn--sm" id="selAll">Select all</button><button type="button" class="btn btn--ghost btn--sm" id="selNone">None</button><button type="button" class="btn btn--ghost btn--sm" id="selHundred">Select 100</button></div>`;
+  box.innerHTML =
+    head +
+    lastPosts
+      .map((p) => {
+        const skip = reportDone.has(p.id);
+        return `<label${skip ? ' class="is-done"' : ""}><input type="checkbox" class="post-cb" value="${p.id}"${skip ? " disabled" : ""}> ${escapeHtml(p.title)} ${builderBadge(p.builder)}${skip ? '<span class="badge">already updated</span>' : ""}<span class="meta">${escapeHtml(p.type)} #${p.id}</span></label>`;
+      })
+      .join("");
+  // "Select all" never re-selects pages the report says are done
+  $("#selAll").onclick = () => { visiblePostCbs().forEach((c) => { if (!c.disabled) c.checked = true; }); updateSelCount(); };
+  $("#selNone").onclick = () => { visiblePostCbs().forEach((c) => (c.checked = false)); updateSelCount(); };
+  sel100Win = 0;
+  $("#selHundred").onclick = applySelect100;
+  filterPostList();
+  updateSelCount();
+}
+
 $("#loadPosts").addEventListener("click", async () => {
   const statuses = $$("#panel-rewrite .statuses input:checked").map((c) => c.value);
   const box = $("#postList");
@@ -329,21 +359,101 @@ $("#loadPosts").addEventListener("click", async () => {
     box.innerHTML = '<span class="meta">No posts matched.</span>';
     return;
   }
-  const head = `<div class="selrow"><strong>${r.posts.length} ${r.posts.length === 1 ? "page" : "pages"} loaded</strong> · <span id="selCount">all selected</span> <button type="button" class="btn btn--ghost btn--sm" id="selAll">Select all</button><button type="button" class="btn btn--ghost btn--sm" id="selNone">None</button><button type="button" class="btn btn--ghost btn--sm" id="selHundred">Select 100</button></div>`;
-  box.innerHTML =
-    head +
-    r.posts
-      .map(
-        (p) =>
-          `<label><input type="checkbox" class="post-cb" value="${p.id}" checked> ${escapeHtml(p.title)} ${builderBadge(p.builder)}<span class="meta">${escapeHtml(p.type)} #${p.id}</span></label>`
-      )
-      .join("");
-  $("#selAll").onclick = () => { visiblePostCbs().forEach((c) => (c.checked = true)); updateSelCount(); };
-  $("#selNone").onclick = () => { visiblePostCbs().forEach((c) => (c.checked = false)); updateSelCount(); };
-  sel100Win = 0;
-  $("#selHundred").onclick = applySelect100;
-  filterPostList();
+  lastPosts = r.posts;
+  renderPostList();
 });
+// --- run report upload: skip pages a previous run already updated -----------
+// Minimal CSV row parser (handles quoted fields, so titles with commas are safe).
+function parseCsvRow(line) {
+  const out = [];
+  let cur = "", q = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (q) {
+      if (ch === '"') {
+        if (line[i + 1] === '"') { cur += '"'; i++; } else { q = false; }
+      } else cur += ch;
+    } else if (ch === '"') q = true;
+    else if (ch === ",") { out.push(cur); cur = ""; }
+    else cur += ch;
+  }
+  out.push(cur);
+  return out;
+}
+
+function parseReportCsv(text) {
+  const lines = text.split(/\r?\n/).filter((l) => l.trim());
+  if (!lines.length) return { ids: new Set(), error: "The report file is empty." };
+  const head = parseCsvRow(lines[0]).map((h) => h.trim().toLowerCase());
+  const iId = head.indexOf("page_id");
+  const iSt = head.indexOf("status");
+  if (iId < 0 || iSt < 0)
+    return { ids: new Set(), error: "That doesn't look like a rewrite report (no page_id/status columns)." };
+  const iTi = head.indexOf("title"), iTm = head.indexOf("time"), iNo = head.indexOf("note");
+  const ids = new Set();
+  const carry = [];
+  let rows = 0;
+  for (let i = 1; i < lines.length; i++) {
+    const c = parseCsvRow(lines[i]);
+    if (c.length <= Math.max(iId, iSt)) continue;
+    rows++;
+    const id = parseInt((c[iId] || "").trim(), 10);
+    // ONLY "updated" is treated as done. pending / skipped / error are rewritten again.
+    if (!isNaN(id) && (c[iSt] || "").trim().toLowerCase() === "updated") {
+      ids.add(id);
+      carry.push({
+        page_id: id,
+        title: iTi >= 0 ? (c[iTi] || "") : "",
+        time: iTm >= 0 ? (c[iTm] || "") : "",
+        note: iNo >= 0 ? (c[iNo] || "") : "",
+      });
+    }
+  }
+  if (!rows) return { ids: new Set(), error: "No page rows found in that report." };
+  return { ids, rows, carry };
+}
+
+$("#uploadReportBtn")?.addEventListener("click", () => $("#reportFile").click());
+
+$("#reportFile")?.addEventListener("change", async (e) => {
+  const f = e.target.files && e.target.files[0];
+  if (!f) return;
+  const info = $("#reportInfo");
+  info.hidden = false;
+  try {
+    const { ids, error, rows, carry } = parseReportCsv(await f.text());
+    if (error) {
+      info.className = "res res--err";
+      info.textContent = error;
+      reportDone = new Set();
+      reportCarry = [];
+    } else {
+      reportDone = ids;
+      reportCarry = carry || [];
+      info.className = "res";
+      info.textContent =
+        `${escapeHtml(f.name)}: ${rows} page(s) in report — ${ids.size} already updated (will be skipped), ` +
+        `the rest will be rewritten.`;
+      $("#clearReportBtn").hidden = false;
+    }
+  } catch (err) {
+    info.className = "res res--err";
+    info.textContent = "Could not read that file.";
+    reportDone = new Set();
+    reportCarry = [];
+  }
+  e.target.value = "";   // allow re-uploading the same file
+  renderPostList();
+});
+
+$("#clearReportBtn")?.addEventListener("click", () => {
+  reportDone = new Set();
+  reportCarry = [];
+  $("#reportInfo").hidden = true;
+  $("#clearReportBtn").hidden = true;
+  renderPostList();
+});
+
 function visiblePostCbs() {
   return $$(".post-cb").filter((c) => {
     const l = c.closest("label");
@@ -353,7 +463,12 @@ function visiblePostCbs() {
 function selectedIds() {
   // Only count rows the current filter is actually showing, so searching also
   // scopes the rewrite (you can't accidentally rewrite hidden, filtered-out pages).
-  return visiblePostCbs().filter((c) => c.checked).map((c) => parseInt(c.value, 10));
+  // Pages an uploaded report marks "updated" are never included, even if a stale
+  // checkbox somehow says otherwise.
+  return visiblePostCbs()
+    .filter((c) => c.checked)
+    .map((c) => parseInt(c.value, 10))
+    .filter((id) => !reportDone.has(id));
 }
 function filterPostList() {
   const q = ($("#postSearch")?.value || "").trim().toLowerCase();
@@ -372,7 +487,7 @@ function updateSelCount() {
   const el = $("#selCount");
   if (!el) return;
   const n = visiblePostCbs().filter((c) => c.checked).length;
-  el.textContent = `${n} selected`;
+  el.textContent = n ? `${n} selected` : "none selected";
 }
 // Update the count when a checkbox is toggled by hand (programmatic changes call
 // updateSelCount directly, since assigning .checked doesn't fire "change").
@@ -399,14 +514,16 @@ function updateSel100Label() {
 }
 function applySelect100() {
   const vis = visiblePostCbs();
-  const total = vis.length;
+  const total = vis.filter((c) => !c.disabled).length;
   if (total === 0) return;
   const windowCount = Math.ceil(total / 100);
   if (sel100Win >= windowCount) sel100Win = 0; // list shrank since last click
   const block = sel100Win;
   const start = block * 100;
   const end = start + 100;
-  vis.forEach((c, i) => (c.checked = i >= start && i < end));
+  const pick = vis.filter((c) => !c.disabled);          // skip report-done pages
+  vis.forEach((c) => (c.checked = false));
+  pick.slice(start, end).forEach((c) => (c.checked = true));
   sel100Active = block; // this block is what's selected now
   sel100Win = (block + 1) % windowCount; // next click selects the following block
   updateSel100Label();
@@ -538,7 +655,7 @@ $("#runRewrite").addEventListener("click", async () => {
     res = await fetch("/api/rewrite", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ rows, placeholders: gatherPlaceholders(), ids, dry_run: dry, elementor: $("#rw-elementor").checked, job_id: rwJobId }),
+      body: JSON.stringify({ rows, placeholders: gatherPlaceholders(), ids, dry_run: dry, elementor: $("#rw-elementor").checked, job_id: rwJobId, carry: reportCarry }),
     });
   } catch (e) {
     appendLog("Couldn't start the rewrite.", "err");

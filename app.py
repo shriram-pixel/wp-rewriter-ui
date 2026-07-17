@@ -218,6 +218,12 @@ def _write_report(path, report, dry_run):
     os.replace(tmp, path)
 
 
+# How many pages are written to the site in one go. The whole batch is a single
+# transaction server-side: it either all lands or none of it does. Bigger = fewer
+# WordPress boots (faster); smaller = fewer pages to redo if a batch fails.
+WRITE_BATCH = 10
+
+
 def _new_report_path():
     os.makedirs(_REPORTS_DIR, exist_ok=True)
     return os.path.join(_REPORTS_DIR, "rewrite-%s.csv" % datetime.now().strftime("%Y%m%d-%H%M%S"))
@@ -295,8 +301,19 @@ def api_rewrite():
             yield json.dumps({"event": "error", "message": "Reading posts failed: " + str(exc)}) + "\n"
             return
 
-        # start the run report: every selected page begins as "pending"
+        # start the run report: pages an uploaded report already marked "updated"
+        # are carried over first, so each new report is CUMULATIVE — upload it next
+        # time and every page done so far is skipped, not just this run's.
         report = {}
+        for row in (data.get("carry") or []):
+            try:
+                cid = int(row.get("page_id"))
+            except (TypeError, ValueError):
+                continue
+            report[cid] = {"title": row.get("title") or ("#%d" % cid),
+                           "status": "updated",
+                           "time": row.get("time") or "",
+                           "note": row.get("note") or ""}
         for pid in ids:
             p = posts.get(pid) or {}
             title = (p.get("title") or "").strip() or ("#%d" % pid)
@@ -326,8 +343,48 @@ def api_rewrite():
 
         counts = {"updated": 0, "preview": 0, "skipped": 0, "error": 0}
         updates = {}
+        notes = {}          # pid -> note, for pages awaiting their write
         pending = list(ids)
         inflight = {}
+
+        def flush_writes(force=False):
+            """Write the queued pages to the site in one transaction, then mark
+            them. On ANY failure the batch is rolled back server-side, so nothing
+            was written and every page in it stays 'pending' to be retried."""
+            if dry_run or not updates:
+                return None
+            if not force and len(updates) < WRITE_BATCH:
+                return None
+            batch = dict(list(updates.items())[:WRITE_BATCH])
+            try:
+                w = core.write_posts(cfg, batch)
+            except Exception as exc:  # noqa: BLE001
+                w = {"ok": False, "written": [], "reason": str(exc), "rc": 1}
+            ts = datetime.now().strftime("%H:%M:%S")
+            if w.get("ok"):
+                for pid in batch:
+                    updates.pop(pid, None)
+                    if report_path and pid in report:
+                        report[pid]["status"] = "updated"
+                        report[pid]["time"] = ts
+                        report[pid]["note"] = notes.get(pid, "")
+                    notes.pop(pid, None)
+            else:
+                reason = (w.get("reason") or "write failed").strip()
+                for pid in batch:
+                    updates.pop(pid, None)
+                    if report_path and pid in report:
+                        # rolled back -> NOT written -> retry it next time
+                        report[pid]["status"] = "pending"
+                        report[pid]["time"] = ""
+                        report[pid]["note"] = "write failed, nothing saved - retry: " + reason[:120]
+                    notes.pop(pid, None)
+            if report_path:
+                try:
+                    _write_report(report_path, report, dry_run)
+                except Exception:  # noqa: BLE001
+                    pass
+            return w
         with ThreadPoolExecutor(max_workers=4) as pool:
             def fill():
                 # Start new pages only while not stopping. Pages already running
@@ -360,15 +417,22 @@ def api_rewrite():
                             else:
                                 updates[pid] = {"type": "content", "value": res["content"]}
                     counts[status] = counts.get(status, 0) + 1
-                    if report_path and pid in report:
+                    kept = res.get("kept") or 0
+                    note = ""
+                    if kept and status in ("updated", "preview"):
+                        note = ("%d paragraph(s) kept original "
+                                "(AI reply rejected) \u2014 re-run to retry" % kept)
+                    elif status in ("skipped", "error"):
+                        note = res.get("message", "")
+                    if status == "updated" and not dry_run:
+                        # NOT marked yet — a page only becomes "updated" once the
+                        # site confirms the write. Until then it stays "pending",
+                        # so an interrupted run never claims unsaved work.
+                        notes[pid] = note
+                    elif report_path and pid in report:
                         report[pid]["status"] = status
                         report[pid]["time"] = datetime.now().strftime("%H:%M:%S")
-                        kept = res.get("kept") or 0
-                        if kept and status in ("updated", "preview"):
-                            report[pid]["note"] = ("%d paragraph(s) kept original "
-                                                   "(AI reply rejected) \u2014 re-run to retry" % kept)
-                        elif status in ("skipped", "error"):
-                            report[pid]["note"] = res.get("message", "")
+                        report[pid]["note"] = note
                         try:
                             _write_report(report_path, report, dry_run)
                         except Exception:  # noqa: BLE001
@@ -377,6 +441,12 @@ def api_rewrite():
                     where = (" (%s)" % b) if (b and b != "classic") else ""
                     yield json.dumps({"event": "post", "id": pid, "status": status,
                                       "message": res["message"] + where}) + "\n"
+                    w = flush_writes()
+                    if w is not None and not w.get("ok"):
+                        yield json.dumps({"event": "error",
+                                          "message": "Write failed - nothing saved for that batch, "
+                                                     "those pages stay pending: "
+                                                     + (w.get("reason") or "")[:160]}) + "\n"
                 fill()
 
         stopped = stop_event.is_set()
@@ -384,14 +454,22 @@ def api_rewrite():
         if stopped:
             yield json.dumps({"event": "stopping", "not_started": not_started}) + "\n"
 
-        if updates and not dry_run:
-            yield json.dumps({"event": "writing", "count": len(updates)}) + "\n"
-            wres = core.write_posts(cfg, updates)
-            if wres["rc"] != 0:
+        # write whatever is left over from the last partial batch
+        while updates and not dry_run:
+            n = len(updates)
+            yield json.dumps({"event": "writing", "count": min(n, WRITE_BATCH)}) + "\n"
+            w = flush_writes(force=True)
+            if w is None:
+                break
+            if not w.get("ok"):
                 yield json.dumps({"event": "post", "id": 0, "status": "error",
-                                  "message": "writing failed: " + (wres["report"] or "")}) + "\n"
+                                  "message": "writing failed - nothing saved for that batch, "
+                                             "those pages stay pending: "
+                                             + (w.get("reason") or "")}) + "\n"
             else:
-                yield json.dumps({"event": "written", "count": wres["count"]}) + "\n"
+                yield json.dumps({"event": "written", "count": len(w.get("written") or [])}) + "\n"
+            if len(updates) >= n:
+                break                      # no progress — don't loop forever
 
         yield json.dumps({"event": "done", "counts": counts, "stopped": stopped,
                           "not_started": not_started, "report": report_path}) + "\n"

@@ -5,9 +5,11 @@ config.ini
 .venv/
 venv/
 __pycache__/
-reports/
 *.pyc
 
 # OS junk
 .DS_Store
 Thumbs.db
+
+# per-run rewrite reports
+reports/

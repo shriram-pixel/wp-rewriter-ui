@@ -751,40 +751,68 @@ _WRITE_RUNNER_PHP = r"""<?php
 if ( ! defined( 'WP_CLI' ) || ! WP_CLI ) { return; }
 $updates = json_decode( file_get_contents( $args[0] ), true );
 $w = $GLOBALS['wpdb'];
-$n = 0;
+
+// The whole batch is ONE transaction: either every page in it is written, or
+// none are. So a failed batch leaves nothing half-written and the agent can
+// safely mark all of its pages "pending" and retry them. A dropped connection
+// mid-write never commits, so MySQL rolls it back too.
+$w->query( 'START TRANSACTION' );
+$done = array();
+$err  = '';
 $elementor_touched = false;
 $beaver_touched = false;
 foreach ( (array) $updates as $id => $u ) {
     $id = (int) $id;
     $type = isset( $u['type'] ) ? $u['type'] : 'content';
-    if ( $type === 'elementor' ) {
-        update_post_meta( $id, '_elementor_data', wp_slash( $u['value'] ) );
-        $elementor_touched = true;
-    } elseif ( $type === 'meta' ) {
-        update_post_meta( $id, $u['key'], wp_slash( $u['value'] ) );
-    } elseif ( $type === 'bricks' ) {
-        // Bricks stores its page content as an array; save it as one.
-        update_post_meta( $id, '_bricks_page_content_2', json_decode( $u['value'], true ) );
-    } elseif ( $type === 'beaver' ) {
-        $data = get_post_meta( $id, '_fl_builder_data', true );
-        if ( is_array( $data ) ) {
-            foreach ( (array) $u['edits'] as $ed ) {
-                $nid = (string) $ed['node']; $field = (string) $ed['field'];
-                if ( isset( $data[ $nid ] ) && is_object( $data[ $nid ] ) && isset( $data[ $nid ]->settings ) ) {
-                    $data[ $nid ]->settings->$field = $ed['value'];
+    $w->last_error = '';
+    try {
+        if ( $type === 'elementor' ) {
+            update_post_meta( $id, '_elementor_data', wp_slash( $u['value'] ) );
+            $elementor_touched = true;
+        } elseif ( $type === 'meta' ) {
+            update_post_meta( $id, $u['key'], wp_slash( $u['value'] ) );
+        } elseif ( $type === 'bricks' ) {
+            // Bricks stores its page content as an array; save it as one.
+            update_post_meta( $id, '_bricks_page_content_2', json_decode( $u['value'], true ) );
+        } elseif ( $type === 'beaver' ) {
+            $data = get_post_meta( $id, '_fl_builder_data', true );
+            if ( is_array( $data ) ) {
+                foreach ( (array) $u['edits'] as $ed ) {
+                    $nid = (string) $ed['node']; $field = (string) $ed['field'];
+                    if ( isset( $data[ $nid ] ) && is_object( $data[ $nid ] ) && isset( $data[ $nid ]->settings ) ) {
+                        $data[ $nid ]->settings->$field = $ed['value'];
+                    }
                 }
+                update_post_meta( $id, '_fl_builder_data', $data );
+                $beaver_touched = true;
             }
-            update_post_meta( $id, '_fl_builder_data', $data );
-            $beaver_touched = true;
+        } else {
+            $r = $w->update( $w->posts, array( 'post_content' => $u['value'] ), array( 'ID' => $id ) );
+            if ( $r === false ) { throw new Exception( 'post_content update failed' ); }
         }
-    } else {
-        $w->update( $w->posts, array( 'post_content' => $u['value'] ), array( 'ID' => $id ) );
+        if ( $w->last_error ) { throw new Exception( $w->last_error ); }
+        $done[] = $id;
+    } catch ( Throwable $e ) {
+        $err = 'page ' . $id . ': ' . $e->getMessage();
+        break;
     }
+}
+
+if ( $err !== '' ) {
+    $w->query( 'ROLLBACK' );
+    echo "ROLLED_BACK " . $err . "\n";
+    echo "UPDATED 0";
+    return;
+}
+$w->query( 'COMMIT' );
+
+// Caches are only touched AFTER the data is committed.
+foreach ( $done as $id ) {
     clean_post_cache( $id );
-    $n++;
+    echo "OK " . $id . "\n";
 }
 if ( function_exists( 'wp_cache_flush' ) ) { wp_cache_flush(); }
-if ( $elementor_touched && class_exists( '\\Elementor\\Plugin' ) ) {
+if ( $elementor_touched && class_exists( '\\\\Elementor\\\\Plugin' ) ) {
     try { \Elementor\Plugin::$instance->files_manager->clear_cache(); } catch ( \Throwable $e ) {}
 }
 if ( $beaver_touched && class_exists( 'FLBuilderModel' ) && method_exists( 'FLBuilderModel', 'delete_asset_cache_for_post' ) ) {
@@ -794,7 +822,7 @@ if ( $beaver_touched && class_exists( 'FLBuilderModel' ) && method_exists( 'FLBu
         }
     }
 }
-echo "UPDATED $n";
+echo "UPDATED " . count( $done );
 """
 
 
@@ -1010,13 +1038,31 @@ def write_posts(cfg, updates):
         payload[str(int(k))] = u
     rc, out, err = _run_php_with_json(cfg, _WRITE_RUNNER_PHP, payload, timeout=1800)
     count = 0
+    written = []
+    rolled_back = False
+    reason = ""
     for ln in out.splitlines():
-        if ln.startswith("UPDATED "):
+        if ln.startswith("OK "):
+            try:
+                written.append(int(ln.split()[1]))
+            except (IndexError, ValueError):
+                pass
+        elif ln.startswith("ROLLED_BACK"):
+            rolled_back = True
+            reason = ln[len("ROLLED_BACK"):].strip()
+        elif ln.startswith("UPDATED "):
             try:
                 count = int(ln.split()[1])
             except (IndexError, ValueError):
                 pass
-    return {"rc": rc, "count": count, "report": (err or "")}
+    # The batch is one transaction: on any failure NOTHING was written, so no
+    # page may be reported as saved.
+    ok = (rc == 0) and not rolled_back and count == len(payload) and len(written) == len(payload)
+    if not ok:
+        written = []
+    return {"rc": rc, "count": count, "report": (err or ""), "ok": ok,
+            "written": written, "rolled_back": rolled_back,
+            "reason": reason or (_clean_stderr(err) if err else "")}
 
 
 def process_one(cfg, post, rows, placeholders):
